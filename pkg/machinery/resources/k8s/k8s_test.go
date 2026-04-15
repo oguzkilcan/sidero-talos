@@ -14,8 +14,10 @@ import (
 	"github.com/cosi-project/runtime/pkg/state/impl/namespaced"
 	"github.com/cosi-project/runtime/pkg/state/registry"
 	"github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/siderolabs/protoenc"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/encoding/protowire"
 
 	"github.com/siderolabs/talos/pkg/machinery/resources/k8s"
 )
@@ -93,4 +95,114 @@ func TestKubeletSpec(t *testing.T) {
 	res, err := protobuf.FromResource(cfg)
 	require.NoError(t, err)
 	require.NotNil(t, res)
+}
+
+// encodeOldExtraArgs encodes a map[string]string as protobuf map entries using a given field number.
+// This simulates how ExtraArgs was encoded in older Talos versions before the ArgValues change.
+func encodeOldExtraArgs(fieldNum protowire.Number, extraArgs map[string]string) []byte {
+	var buf []byte
+
+	for key, value := range extraArgs {
+		// Each map entry is a submessage with field 1 = key, field 2 = value (both strings).
+		var entry []byte
+		entry = protowire.AppendTag(entry, 1, protowire.BytesType)
+		entry = protowire.AppendString(entry, key)
+		entry = protowire.AppendTag(entry, 2, protowire.BytesType)
+		entry = protowire.AppendString(entry, value)
+
+		buf = protowire.AppendTag(buf, fieldNum, protowire.BytesType)
+		buf = protowire.AppendBytes(buf, entry)
+	}
+
+	return buf
+}
+
+func TestArgValuesBackwardsCompatibility(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name     string
+		expected k8s.ArgValues
+		data     []byte
+	}{
+		{
+			name: "old format single value",
+			data: []byte("true"),
+			expected: k8s.ArgValues{
+				Values: []string{"true"},
+			},
+		},
+		{
+			name: "old format path value",
+			data: []byte("/etc/kubernetes/pki"),
+			expected: k8s.ArgValues{
+				Values: []string{"/etc/kubernetes/pki"},
+			},
+		},
+		{
+			name: "old format empty value",
+			data: []byte(""),
+			expected: k8s.ArgValues{
+				Values: []string{""},
+			},
+		},
+		{
+			name: "new format single value",
+			expected: k8s.ArgValues{
+				Values: []string{"bar"},
+			},
+		},
+		{
+			name: "new format multiple values",
+			expected: k8s.ArgValues{
+				Values: []string{"val1", "val2", "val3"},
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			data := test.data
+			if data == nil {
+				// Encode using protoenc (new format).
+				var err error
+
+				data, err = protoenc.Marshal(&test.expected)
+				require.NoError(t, err)
+			}
+
+			var result k8s.ArgValues
+			require.NoError(t, result.UnmarshalBinary(data))
+			assert.Equal(t, test.expected, result)
+		})
+	}
+}
+
+func TestKubeletConfigOldExtraArgsFormat(t *testing.T) {
+	t.Parallel()
+
+	// Encode a KubeletConfig with the OLD map[string]string format for ExtraArgs (field 4).
+	// This simulates what an older Talos node sends over COSI gRPC.
+	oldExtraArgs := map[string]string{
+		"rotate-server-certificates": "true",
+		"node-labels":                "env=prod",
+	}
+
+	// Build a minimal KubeletConfig protobuf: field 1 (image) + field 4 (extraArgs as old format).
+	var buf []byte
+	// Field 1: Image (string)
+	buf = protowire.AppendTag(buf, 1, protowire.BytesType)
+	buf = protowire.AppendString(buf, "ghcr.io/siderolabs/kubelet:v1.35.0")
+	// Field 4: ExtraArgs (old map[string]string format)
+	buf = append(buf, encodeOldExtraArgs(4, oldExtraArgs)...)
+
+	var spec k8s.KubeletConfigSpec
+	require.NoError(t, protoenc.Unmarshal(buf, &spec))
+
+	assert.Equal(t, "ghcr.io/siderolabs/kubelet:v1.35.0", spec.Image)
+
+	for key, expectedValue := range oldExtraArgs {
+		require.Contains(t, spec.ExtraArgs, key)
+		assert.Equal(t, []string{expectedValue}, spec.ExtraArgs[key].Values)
+	}
 }

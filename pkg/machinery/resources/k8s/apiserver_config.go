@@ -10,6 +10,7 @@ import (
 	"github.com/cosi-project/runtime/pkg/resource/meta"
 	"github.com/cosi-project/runtime/pkg/resource/protobuf"
 	"github.com/cosi-project/runtime/pkg/resource/typed"
+	"google.golang.org/protobuf/encoding/protowire"
 
 	"github.com/siderolabs/talos/pkg/machinery/proto"
 )
@@ -63,6 +64,61 @@ type APIServerConfigSpec struct {
 //gotagsrewrite:gen
 type ArgValues struct {
 	Values []string `yaml:"values" protobuf:"1"`
+}
+
+// MarshalBinary implements encoding.BinaryMarshaler.
+func (a ArgValues) MarshalBinary() ([]byte, error) {
+	var buf []byte
+
+	for _, v := range a.Values {
+		buf = protowire.AppendTag(buf, 1, protowire.BytesType)
+		buf = protowire.AppendString(buf, v)
+	}
+
+	return buf, nil
+}
+
+// UnmarshalBinary implements encoding.BinaryUnmarshaler.
+//
+// This provides backwards compatibility with older Talos versions where ExtraArgs
+// was map[string]string. When the protobuf bytes represent a plain string (old format),
+// they are treated as a single-element Values slice.
+func (a *ArgValues) UnmarshalBinary(data []byte) error {
+	// Try to decode as a protobuf message (new format: repeated string field 1).
+	var values []string
+
+	buf := data
+	for len(buf) > 0 {
+		num, typ, n := protowire.ConsumeTag(buf)
+		if n < 0 {
+			break
+		}
+
+		buf = buf[n:]
+
+		if num != 1 || typ != protowire.BytesType {
+			break
+		}
+
+		val, n := protowire.ConsumeBytes(buf)
+		if n < 0 {
+			break
+		}
+
+		buf = buf[n:]
+		values = append(values, string(val))
+	}
+
+	if len(buf) == 0 && len(values) > 0 {
+		a.Values = values
+
+		return nil
+	}
+
+	// Fall back: treat entire data as a single string value (old map[string]string format).
+	a.Values = []string{string(data)}
+
+	return nil
 }
 
 // NewAPIServerConfig returns new APIServerConfig resource.
